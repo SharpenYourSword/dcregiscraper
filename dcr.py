@@ -1,10 +1,10 @@
 from lxml import html
-import urllib2
+from urllib import request
 import re
 import json
 import time
+from selenium import webdriver
 from datetime import datetime
-import dcr_notice
 
 def isoFromString (date_string):
 	#December 31, 2010
@@ -19,7 +19,7 @@ def get_DCRs_by_year (issue_year):
 	# Note, the years are from 2009 to 2014
 	data = []
 	url = "http://dcregs.dc.gov/Gateway/IssueList.aspx?IssueYear=" + str(issue_year)
-	issue_page_url = urllib2.urlopen(url)
+	issue_page_url = request.urlopen(url)
 	issue_page = html.parse(issue_page_url)
 	issues = issue_page.xpath('//div[@id="ctl00_ContentPlaceHolder_divYearIssue"]//li/a')
 	for issue in issues:
@@ -40,8 +40,7 @@ def get_DCRs_by_year (issue_year):
 				"pdf_url": get_issue_PDF(issue_id)
 				})
 
-		except Exception, e:
-			print e
+		except:
 			continue
 	return data
 
@@ -51,7 +50,7 @@ def get_DCRs_by_year (issue_year):
 # ---------------------------------------------------------------
 def get_issue_PDF (issue_id):
 	url = "http://dcregs.dc.gov/Gateway/IssueHome.aspx?IssueId=" + str(issue_id)
-	issue_page = html.parse(urllib2.urlopen(url))
+	issue_page = html.parse(request.urlopen(url))
 	issue_url = issue_page.xpath("//a[@id='ctl00_ContentPlaceHolder_hlRegisterFile']/@href")[0]
 	return issue_url
 
@@ -65,10 +64,10 @@ def get_issue_PDF (issue_id):
 def get_issue_notices (issue_id):
 	data = []
 	url = "http://dcregs.dc.gov/Gateway/IssueHome.aspx?IssueId=" + str(issue_id)
-	issue_page = html.parse(urllib2.urlopen(url))
+	issue_page = html.parse(request.urlopen(url))
 	issue_council_actions = issue_page.xpath("//table[@id='ctl00_ContentPlaceHolder_dlCouncilIssueList']//div[@class='issuestext']//a[1]")
 	for action in issue_council_actions:
-		action_url = action.xpath("@href")[0]
+		action_url = action.xpath("@href")[0].replace("..","http://dcregs.dc.gov")
 		action_description = action.xpath("text()")[0]
 		data.append({
 			"action_url":action_url, 
@@ -77,11 +76,12 @@ def get_issue_notices (issue_id):
 		})
 	issue_executive_actions = issue_page.xpath("//table[@id='ctl00_ContentPlaceHolder_dlAgencyIssueList']//div[@class='issuestext']//a[1]")
 	for action in issue_executive_actions:
-		action_url = action.xpath("@href")[0]
+		action_url = action.xpath("@href")[0].replace("..","http://dcregs.dc.gov")
 		action_description = action.xpath("text()")[0]
 		data.append({
 			"action_url":action_url, 
-			"action_description":action_description
+			"action_description":action_description,
+			"action_items":get_action_notices(action_url)
 		})
 	
 	return data
@@ -93,21 +93,49 @@ def get_issue_notices (issue_id):
 def get_action_notices (action_url):
 	# Ok. So. Here's the approach. There are two main steps. First, you get the metadata for the page that you're on. 
 	# Then, you figure out whether there are multiple pages and, if so, you navigate to that page and start again. 
-	
+
 	notice_data = []
-	next_page = 1
-	while (next_page != null):
-		notice_page = html.parse(urllib2.urlopen(action_url))
-		notice_actions = notice_page.xpath("//table[@id]='ctl00_ContentPlaceHolder_gvNotice'")
+	driver = webdriver.PhantomJS()
+	driver.get(action_url)
 
-		# You actually need to click through to get to the metadata page
+	# Find the total number of records & divide by 15 to calculate the total number of pages
+	pages = int(driver.find_element_by_id("ctl00_ContentPlaceHolder_lblCount").text) / 15
+	i = 0
+	out = driver.find_element_by_id("ctl00_ContentPlaceHolder_gvNotice").get_attribute("outerHTML")
+	notice_data.extend(get_json_of_notices(out))
 
-		notice_data.append({
-			"notice_title": notice_title,
-			"notice_text": notice_text,
-			"notice_url": notice_url
-		})
+	# Loop through each page to get all of the rows
+	while i < pages:
+		i = 1 + i
+		driver.execute_script("__doPostBack('ctl00$ContentPlaceHolder$gvNotice','Page$" + str(i + 1) + "')")
+		time.sleep(3)
+		out = driver.find_element_by_id("ctl00_ContentPlaceHolder_gvNotice").get_attribute("outerHTML")
+		notice_data.extend(get_json_of_notices(out))
+
+	driver.quit
+
 	return notice_data
+
+def get_json_of_notices (table):
+	data = []
+	table = html.document_fromstring(table)
+	rows = table.xpath("//tr")
+	for row in rows:
+		cells = row.xpath("td")
+		if len(cells) > 2:
+			if cells[0].text_content().strip() != "1":
+				if len(cells) == 5:
+					data.append({
+						"notice_id": cells[0].text_content().strip(),
+						"notice_title":cells[2].text_content().strip()
+					})
+				else:
+					data.append({
+						"notice_id": cells[0].text_content().strip(),
+						"notice_title":cells[1].text_content().strip()
+					})
+	return data
+
 
 # ---------------------------------------------------------------
 # create_DCR_json:	This generates a huge JSON file of the 
@@ -124,4 +152,16 @@ def create_DCR_json ():
 		issue_year = issue_year + 1
 	return out_data
 
-print json.dumps(create_DCR_json(), indent=2)
+#print(json.dumps(create_DCR_json(), indent=2))
+
+def write_issue_to_file (issue_no):
+	with open("issues/" + issue_no + ".json", 'w') as f:
+	  	json.dump(get_issue_notices(issue_no), f, indent=2)
+
+f = open('dcr_issue_metadata.json','r')
+f = json.load(f)[1]
+for issue in f["issues"]:
+	write_issue_to_file(issue["id"])
+	print("Issue " + issue["id"] + ": written to file")
+
+#print(json.dumps(get_issue_notices("432"),indent=2))
